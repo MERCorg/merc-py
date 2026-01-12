@@ -33,13 +33,17 @@ class RunProcess:
         """
 
         try:
+            # Use a separate timer to measure user time
             before = time.perf_counter()
             with subprocess.Popen(
                 [tool] + arguments,
+                # Merge stderr and stdout into one, so we don't have to handle both streams in separate threads.
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
+                # Pass the environment
                 env=env,
+                # 1 means line buffered (only usable if text=True or universal_newlines=True)
+                text=True,
                 bufsize=1,
             ) as proc:
                 self._user_time = 0
@@ -76,17 +80,17 @@ class RunProcess:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                     future = executor.submit(enforce_limits, proc)
 
-                    # Print all output (stdout + stderr merged)
+                    # Process the output while the process is running
                     if proc.stdout:
                         for line in proc.stdout:
                             if read_stdout:
                                 read_stdout(line.rstrip("\n"))
                     
-                    # Wait for termination
-                    future.result()
+                    # EOF was reached, wait for process to terminate (if it hasn't already)
+                    proc.wait()
 
-                # At this point the process already terminated if enforce_limits didn't raise a `NoSuchProcess` exception
-                proc.wait()
+                    # Wait for the limit enforcement thread to finish
+                    future.result()
 
                 # Use the realtime to measure user time more accurately
                 self._user_time = time.perf_counter() - before

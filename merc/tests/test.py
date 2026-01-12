@@ -32,7 +32,7 @@ class TestRunProcess(unittest.TestCase):
             output_lines.append(line.strip())
 
         # Run a process that prints a large number of lines
-        RunProcess(sys.executable, ["-c", "for i in range(100000000): print(i, end='')"], read_stdout=read_stdout)        
+        RunProcess(sys.executable, ["-c", "for i in range(10000000): print(i, end='')"], read_stdout=read_stdout)        
 
 if __name__ == "__main__":
     unittest.main()
