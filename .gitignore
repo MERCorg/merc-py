@@ -3,3 +3,6 @@
 
 # Python generated files
 __pycache__
+
+# Ignore the egg-info directory
+*.egg-info/
