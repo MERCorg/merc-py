@@ -3,6 +3,7 @@
 
 from .run_process import RunProcess, TimeExceededError, MemoryExceededError, ToolNotFoundError
 from .logger import MercLogger
+from .benchmarks import Benchmarks
 
 # This is used to avoid unused-import warnings
 __all__ = [
@@ -11,4 +12,5 @@ __all__ = [
     "MemoryExceededError",
     "ToolNotFoundError",
     "MercLogger",
+    "Benchmarks",
 ]
