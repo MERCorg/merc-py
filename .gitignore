@@ -6,3 +6,6 @@ __pycache__
 
 # Ignore the egg-info directory
 *.egg-info/
+
+# Ignore the build directory
+build/
