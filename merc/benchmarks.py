@@ -1,5 +1,7 @@
 import json
-from dataclasses import dataclass, field
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 
 from .logger import MercLogger
 from .run_process import (
@@ -17,14 +19,23 @@ class _Entry:
     arguments: list[str]
     extra: dict
     runs: int
+    threads: int
 
 
 class Benchmarks:
     """Collects benchmark configurations and runs them, writing results to NDJSON."""
 
-    def __init__(self, runs: int = 5, logger: MercLogger | None = None):
+    def __init__(
+        self,
+        runs: int = 5,
+        max_threads: int = 1,
+        sequential: bool = False,
+        logger: MercLogger | None = None,
+    ):
         self._entries: list[_Entry] = []
         self._default_runs = runs
+        self._max_threads = max_threads
+        self._sequential = sequential
         self._logger = logger or MercLogger()
 
     def add(
@@ -34,6 +45,7 @@ class Benchmarks:
         arguments: list[str],
         extra: dict | None = None,
         runs: int | None = None,
+        threads: int = 1,
     ) -> None:
         """Register a benchmark.
 
@@ -43,7 +55,12 @@ class Benchmarks:
             arguments: CLI arguments for the tool.
             extra:     Additional fields merged into every result record.
             runs:      Number of repetitions (overrides the class default).
+            threads:   Thread slots this benchmark occupies (default 1).
         """
+        if threads > self._max_threads:
+            raise ValueError(
+                f"threads={threads} for '{name}' exceeds max_threads={self._max_threads}"
+            )
         self._entries.append(
             _Entry(
                 name=name,
@@ -51,6 +68,7 @@ class Benchmarks:
                 arguments=arguments,
                 extra=extra or {},
                 runs=runs if runs is not None else self._default_runs,
+                threads=threads,
             )
         )
 
@@ -59,6 +77,14 @@ class Benchmarks:
 
         Raises ToolNotFoundError if a tool binary cannot be found.
         """
+        if self._sequential:
+            self._run_sequential(output)
+        else:
+            self._run_parallel(output)
+
+        self._logger.info("Results written to %s", output)
+
+    def _run_sequential(self, output: str) -> None:
         total = sum(e.runs for e in self._entries)
         done = 0
 
@@ -66,38 +92,87 @@ class Benchmarks:
             for entry in self._entries:
                 for run_idx in range(entry.runs):
                     done += 1
-                    self._logger.info(
-                        "[%d/%d] %s  run %d/%d ...",
-                        done,
-                        total,
-                        entry.name,
-                        run_idx + 1,
-                        entry.runs,
-                    )
-
                     result = self._run_one(entry.tool, entry.arguments)
-
-                    if result["status"] == "ok":
-                        self._logger.info(
-                            "  %.2fs  %.1fMB", result["time_s"], result["memory_mb"]
-                        )
-                    elif result["status"] == "timeout":
-                        self._logger.warning("  timeout after %.2fs", result["time_s"])
-                    elif result["status"] == "oom":
-                        self._logger.warning("  OOM at %.1fMB", result["memory_mb"])
-                    else:
-                        self._logger.error("  error: %s", result.get("message"))
-
-                    record = {
-                        "name": entry.name,
-                        "run": run_idx + 1,
-                        **entry.extra,
-                        **result,
-                    }
+                    self._log_result(result, done, total, entry, run_idx)
+                    record = {"name": entry.name, "run": run_idx + 1, **entry.extra, **result}
                     out.write(json.dumps(record) + "\n")
                     out.flush()
 
-        self._logger.info("Results written to %s", output)
+    def _run_parallel(self, output: str) -> None:
+        total = sum(e.runs for e in self._entries)
+        done = [0]
+        done_lock = threading.Lock()
+        file_lock = threading.Lock()
+
+        # Weighted semaphore: limits the total thread slots in use across all
+        # concurrent jobs so that sum(running threads) <= max_threads.
+        available = [self._max_threads]
+        slots_cond = threading.Condition()
+
+        def _acquire(n: int) -> None:
+            with slots_cond:
+                while available[0] < n:
+                    slots_cond.wait()
+                available[0] -= n
+
+        def _release(n: int) -> None:
+            with slots_cond:
+                available[0] += n
+                slots_cond.notify_all()
+
+        def _run_entry(entry: _Entry, run_idx: int, out) -> None:
+            _acquire(entry.threads)
+            try:
+                result = self._run_one(entry.tool, entry.arguments)
+            finally:
+                _release(entry.threads)
+
+            with done_lock:
+                done[0] += 1
+                current_done = done[0]
+
+            self._log_result(result, current_done, total, entry, run_idx)
+
+            record = {"name": entry.name, "run": run_idx + 1, **entry.extra, **result}
+            with file_lock:
+                out.write(json.dumps(record) + "\n")
+                out.flush()
+
+        with open(output, "w", encoding="utf-8") as out:
+            with ThreadPoolExecutor(max_workers=self._max_threads) as executor:
+                futures = [
+                    executor.submit(_run_entry, entry, run_idx, out)
+                    for entry in self._entries
+                    for run_idx in range(entry.runs)
+                ]
+                for future in as_completed(futures):
+                    future.result()  # re-raise ToolNotFoundError or other exceptions
+
+    def _log_result(self, result: dict, done: int, total: int, entry: _Entry, run_idx: int) -> None:
+        if result["status"] == "ok":
+            self._logger.info(
+                "[%d/%d] %s  run %d/%d  %.2fs  %.1fMB",
+                done, total, entry.name, run_idx + 1, entry.runs,
+                result["time_s"], result["memory_mb"],
+            )
+        elif result["status"] == "timeout":
+            self._logger.warning(
+                "[%d/%d] %s  run %d/%d  timeout after %.2fs",
+                done, total, entry.name, run_idx + 1, entry.runs,
+                result["time_s"],
+            )
+        elif result["status"] == "oom":
+            self._logger.warning(
+                "[%d/%d] %s  run %d/%d  OOM at %.1fMB",
+                done, total, entry.name, run_idx + 1, entry.runs,
+                result["memory_mb"],
+            )
+        else:
+            self._logger.error(
+                "[%d/%d] %s  run %d/%d  error: %s",
+                done, total, entry.name, run_idx + 1, entry.runs,
+                result.get("message"),
+            )
 
     def _run_one(self, tool: str, arguments: list[str]) -> dict:
         try:
