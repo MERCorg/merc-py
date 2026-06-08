@@ -144,6 +144,14 @@ class Benchmarks:
                 out.write(json.dumps(record) + "\n")
                 out.flush()
 
+        # Submit largest-threads-first so high-slot tasks acquire the semaphore
+        # before small tasks get executor OS threads, reducing fragmentation.
+        work = sorted(
+            ((entry, run_idx) for entry in self._entries for run_idx in range(entry.runs)),
+            key=lambda x: x[0].threads,
+            reverse=True,
+        )
+
         with open(output, "w", encoding="utf-8") as out:
             with ThreadPoolExecutor(max_workers=self._max_threads) as executor:
                 futures = [
