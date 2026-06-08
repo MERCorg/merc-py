@@ -20,6 +20,8 @@ class _Entry:
     extra: dict
     runs: int
     threads: int
+    timeout: float | None
+    memory_limit: float | None
 
 
 class Benchmarks:
@@ -46,6 +48,8 @@ class Benchmarks:
         extra: dict | None = None,
         runs: int | None = None,
         threads: int = 1,
+        timeout: float | None = None,
+        memory_limit: float | None = None,
     ) -> None:
         """Register a benchmark.
 
@@ -69,6 +73,8 @@ class Benchmarks:
                 extra=extra or {},
                 runs=runs if runs is not None else self._default_runs,
                 threads=threads,
+                timeout=timeout,
+                memory_limit=memory_limit,
             )
         )
 
