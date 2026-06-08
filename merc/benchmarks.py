@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -33,12 +34,14 @@ class Benchmarks:
         max_threads: int = 1,
         sequential: bool = False,
         logger: MercLogger | None = None,
+        dump_dir: str | None = None,
     ):
         self._entries: list[_Entry] = []
         self._default_runs = runs
         self._max_threads = max_threads
         self._sequential = sequential
         self._logger = logger or MercLogger()
+        self._dump_dir = dump_dir
 
     def add(
         self,
@@ -54,12 +57,14 @@ class Benchmarks:
         """Register a benchmark.
 
         Args:
-            name:      Human-readable label shown in progress output.
-            tool:      Executable path passed to RunProcess.
-            arguments: CLI arguments for the tool.
-            extra:     Additional fields merged into every result record.
-            runs:      Number of repetitions (overrides the class default).
-            threads:   Thread slots this benchmark occupies (default 1).
+            name:         Human-readable label shown in progress output.
+            tool:         Executable path passed to RunProcess.
+            arguments:    CLI arguments for the tool.
+            extra:        Additional fields merged into every result record.
+            runs:         Number of repetitions (overrides the class default).
+            threads:      Thread slots this benchmark occupies (default 1).
+            timeout:      Maximum wall-clock seconds before the run is killed.
+            memory_limit: Maximum resident memory in MB before the run is killed.
         """
         if threads > self._max_threads:
             raise ValueError(
@@ -83,6 +88,9 @@ class Benchmarks:
 
         Raises ToolNotFoundError if a tool binary cannot be found.
         """
+        if self._dump_dir:
+            os.makedirs(self._dump_dir, exist_ok=True)
+
         if self._sequential:
             self._run_sequential(output)
         else:
@@ -98,7 +106,7 @@ class Benchmarks:
             for entry in self._entries:
                 for run_idx in range(entry.runs):
                     done += 1
-                    result = self._run_one(entry.tool, entry.arguments)
+                    result = self._run_one(entry)
                     self._log_result(result, done, total, entry, run_idx)
                     record = {"name": entry.name, "run": run_idx + 1, **entry.extra, **result}
                     out.write(json.dumps(record) + "\n")
@@ -129,7 +137,7 @@ class Benchmarks:
         def _run_entry(entry: _Entry, run_idx: int, out) -> None:
             _acquire(entry.threads)
             try:
-                result = self._run_one(entry.tool, entry.arguments)
+                result = self._run_one(entry)
             finally:
                 _release(entry.threads)
 
@@ -156,8 +164,7 @@ class Benchmarks:
             with ThreadPoolExecutor(max_workers=self._max_threads) as executor:
                 futures = [
                     executor.submit(_run_entry, entry, run_idx, out)
-                    for entry in self._entries
-                    for run_idx in range(entry.runs)
+                    for entry, run_idx in work
                 ]
                 for future in as_completed(futures):
                     future.result()  # re-raise ToolNotFoundError or other exceptions
@@ -188,15 +195,48 @@ class Benchmarks:
                 result.get("message"),
             )
 
-    def _run_one(self, tool: str, arguments: list[str]) -> dict:
+    def _run_one(self, entry: _Entry) -> dict:
+        kwargs: dict = {}
+        if entry.timeout is not None:
+            kwargs["max_time"] = entry.timeout
+        if entry.memory_limit is not None:
+            kwargs["max_memory"] = entry.memory_limit
+
+        stdout_f = None
+        stderr_f = None
         try:
-            proc = RunProcess(tool, arguments)
-            return {"status": "ok", "time_s": proc.user_time, "memory_mb": proc.max_memory}
-        except TimeExceededError as e:
-            return {"status": "timeout", "time_s": e.value}
-        except MemoryExceededError as e:
-            return {"status": "oom", "memory_mb": e.value}
-        except ToolNotFoundError:
-            raise
-        except Exception as e:  # pylint: disable=broad-except
-            return {"status": "error", "message": str(e)}
+            if self._dump_dir:
+                # buffering=1 gives line-buffered writes so each line hits the file immediately.
+                # Each run opens its own handle in append mode; O_APPEND makes concurrent
+                # writes from parallel runs of the same benchmark atomic at the OS level.
+                stdout_f = open(
+                    os.path.join(self._dump_dir, f"{entry.name}.stdout"),
+                    "a", encoding="utf-8", buffering=1,
+                )
+                stderr_f = open(
+                    os.path.join(self._dump_dir, f"{entry.name}.stderr"),
+                    "a", encoding="utf-8", buffering=1,
+                )
+
+            try:
+                proc = RunProcess(
+                    entry.tool,
+                    entry.arguments,
+                    read_stdout=lambda line: stdout_f.write(line + "\n") if stdout_f else None,
+                    read_stderr=lambda line: stderr_f.write(line + "\n") if stderr_f else None,
+                    **kwargs,
+                )
+                return {"status": "ok", "time_s": proc.user_time, "memory_mb": proc.max_memory}
+            except TimeExceededError as e:
+                return {"status": "timeout", "time_s": e.value}
+            except MemoryExceededError as e:
+                return {"status": "oom", "memory_mb": e.value}
+            except ToolNotFoundError:
+                raise
+            except Exception as e:  # pylint: disable=broad-except
+                return {"status": "error", "message": str(e)}
+        finally:
+            if stdout_f:
+                stdout_f.close()
+            if stderr_f:
+                stderr_f.close()
