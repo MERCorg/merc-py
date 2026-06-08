@@ -7,6 +7,7 @@
 import subprocess
 import concurrent.futures
 import sys
+import threading
 import time
 
 from typing import Callable
@@ -15,8 +16,6 @@ import psutil
 
 
 class RunProcess:
-    stdout = ""
-    stderr = ""
     returncode = -1
 
     def __init__(
@@ -24,6 +23,7 @@ class RunProcess:
         tool: str,
         arguments: list[str],
         read_stdout: Callable[[str], None] | None = None,
+        read_stderr: Callable[[str], None] | None = None,
         env: dict[str, str] | None = None,
         max_time: int = sys.maxsize,
         max_memory: int = sys.maxsize,
@@ -32,14 +32,16 @@ class RunProcess:
         Run the process tool with the given arguments, using at most max_memory MB of resident set memory, and max_time seconds
         """
 
+        self.stdout = ""
+        self.stderr = ""
+
         try:
             # Use a separate timer to measure user time
             before = time.perf_counter()
             with subprocess.Popen(
                 [tool] + arguments,
-                # Merge stderr and stdout into one, so we don't have to handle both streams in separate threads.
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.PIPE,
                 # Pass the environment
                 env=env,
                 # 1 means line buffered (only usable if text=True or universal_newlines=True)
@@ -49,13 +51,16 @@ class RunProcess:
                 self._time_used = 0
                 self._max_memory_used = 0
 
+                stdout_lines: list[str] = []
+                stderr_lines: list[str] = []
+
                 # Start a thread to limit the process memory and time usage.
                 def enforce_limits(proc):
                     try:
                         process = psutil.Process(proc.pid)
                         while proc.returncode is None:
                             m = process.memory_full_info()
-                            
+
                             if "uss" in m:
                                 # Use USS if available (Linux)
                                 self._max_memory_used = max(
@@ -82,28 +87,44 @@ class RunProcess:
                         # The tool finished before we could acquire the pid
                         None  # type: ignore
 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(enforce_limits, proc)
+                def collect_stderr():
+                    if proc.stderr:
+                        for line in proc.stderr:
+                            stderr_lines.append(line)
+                            if read_stderr:
+                                read_stderr(line.rstrip("\n"))
 
-                    # Process the output while the process is running
-                    if proc.stdout:
-                        for line in proc.stdout:
-                            if read_stdout:
-                                read_stdout(line.rstrip("\n"))
-                    
-                    # EOF was reached, wait for process to terminate (without this the returncode is never set)
-                    proc.wait()
+                stderr_thread = threading.Thread(target=collect_stderr, daemon=True)
+                stderr_thread.start()
 
-                    # Wait for the limit enforcement thread to finish
-                    future.result()
+                try:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(enforce_limits, proc)
 
-                # Measure the real time since its the most accurate
-                self._time_used = time.perf_counter() - before
+                        # Process the output while the process is running
+                        if proc.stdout:
+                            for line in proc.stdout:
+                                stdout_lines.append(line)
+                                if read_stdout:
+                                    read_stdout(line.rstrip("\n"))
 
-                if proc.returncode != 0:
-                    raise ToolRuntimeError(
-                        f"Tool {tool} {arguments} ended with return code {proc.returncode}"
-                    )
+                        # EOF was reached, wait for process to terminate (without this the returncode is never set)
+                        proc.wait()
+
+                        # Wait for the limit enforcement thread to finish
+                        future.result()
+
+                    # Measure the real time since its the most accurate
+                    self._time_used = time.perf_counter() - before
+
+                    if proc.returncode != 0:
+                        raise ToolRuntimeError(
+                            f"Tool {tool} {arguments} ended with return code {proc.returncode}"
+                        )
+                finally:
+                    stderr_thread.join()
+                    self.stdout = "".join(stdout_lines)
+                    self.stderr = "".join(stderr_lines)
 
         except FileNotFoundError as e:
             raise ToolNotFoundError(tool) from e
