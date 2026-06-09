@@ -25,10 +25,10 @@ class _Entry:
     memory_limit: float | None
 
 
-def _load_existing_names(output: str) -> set[str]:
-    names: set[str] = set()
+def _load_existing_counts(output: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
     if not os.path.exists(output):
-        return names
+        return counts
     with open(output, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -37,10 +37,10 @@ def _load_existing_names(output: str) -> set[str]:
             try:
                 record = json.loads(line)
                 if "name" in record:
-                    names.add(record["name"])
+                    counts[record["name"]] = counts.get(record["name"], 0) + 1
             except json.JSONDecodeError:
                 pass
-    return names
+    return counts
 
 
 class Benchmarks:
@@ -112,9 +112,9 @@ class Benchmarks:
         if self._dump_dir:
             os.makedirs(self._dump_dir, exist_ok=True)
 
-        existing = _load_existing_names(output)
-        for name in existing:
-            self._logger.info("Skipping '%s' (already in %s)", name, output)
+        existing = _load_existing_counts(output)
+        for name, count in existing.items():
+            self._logger.info("Found %d existing run(s) for '%s' in %s", count, name, output)
 
         if self._sequential:
             self._run_sequential(output, existing)
@@ -123,24 +123,41 @@ class Benchmarks:
 
         self._logger.info("Results written to %s", output)
 
-    def _run_sequential(self, output: str, existing: set[str]) -> None:
-        entries = [e for e in self._entries if e.name not in existing]
-        total = sum(e.runs for e in entries)
+    def _pending_work(
+        self, existing: dict[str, int]
+    ) -> tuple[list[tuple[_Entry, int, int]], int]:
+        """Return (work_list, total_runs) for entries that still need runs."""
+        work: list[tuple[_Entry, int, int]] = []
+        for e in self._entries:
+            already_done = existing.get(e.name, 0)
+            remaining = e.runs - already_done
+            if remaining > 0:
+                work.append((e, already_done, remaining))
+        total = sum(remaining for _, _, remaining in work)
+        return work, total
+
+    @staticmethod
+    def _make_record(entry: _Entry, run_idx: int, result: dict) -> str:
+        """Build an NDJSON line for one benchmark run."""
+        record = {"name": entry.name, "run": run_idx + 1, **entry.extra, **result}
+        return json.dumps(record) + "\n"
+
+    def _run_sequential(self, output: str, existing: dict[str, int]) -> None:
+        work, total = self._pending_work(existing)
         done = 0
 
         with open(output, "a", encoding="utf-8") as out:
-            for entry in entries:
-                for run_idx in range(entry.runs):
+            for entry, already_done, remaining in work:
+                for i in range(remaining):
+                    run_idx = already_done + i
                     done += 1
-                    result = self._run_one(entry)
+                    result = self._run_one(entry, run_idx)
                     self._log_result(result, done, total, entry, run_idx)
-                    record = {"name": entry.name, "run": run_idx + 1, **entry.extra, **result}
-                    out.write(json.dumps(record) + "\n")
+                    out.write(self._make_record(entry, run_idx, result))
                     out.flush()
 
-    def _run_parallel(self, output: str, existing: set[str]) -> None:
-        entries = [e for e in self._entries if e.name not in existing]
-        total = sum(e.runs for e in entries)
+    def _run_parallel(self, output: str, existing: dict[str, int]) -> None:
+        work_entries, total = self._pending_work(existing)
         done = [0]
         done_lock = threading.Lock()
         file_lock = threading.Lock()
@@ -164,7 +181,7 @@ class Benchmarks:
         def _run_entry(entry: _Entry, run_idx: int, out) -> None:
             _acquire(entry.threads)
             try:
-                result = self._run_one(entry)
+                result = self._run_one(entry, run_idx)
             finally:
                 _release(entry.threads)
 
@@ -174,15 +191,14 @@ class Benchmarks:
 
             self._log_result(result, current_done, total, entry, run_idx)
 
-            record = {"name": entry.name, "run": run_idx + 1, **entry.extra, **result}
             with file_lock:
-                out.write(json.dumps(record) + "\n")
+                out.write(self._make_record(entry, run_idx, result))
                 out.flush()
 
         # Submit largest-threads-first so high-slot tasks acquire the semaphore
         # before small tasks get executor OS threads, reducing fragmentation.
         work = sorted(
-            ((entry, run_idx) for entry in entries for run_idx in range(entry.runs)),
+            ((entry, already_done + i) for entry, already_done, remaining in work_entries for i in range(remaining)),
             key=lambda x: x[0].threads,
             reverse=True,
         )
@@ -222,7 +238,7 @@ class Benchmarks:
                 result.get("message"),
             )
 
-    def _run_one(self, entry: _Entry) -> dict:
+    def _run_one(self, entry: _Entry, run_idx: int) -> dict:
         kwargs: dict = {}
         if entry.timeout is not None:
             kwargs["max_time"] = entry.timeout
@@ -234,15 +250,13 @@ class Benchmarks:
         try:
             if self._dump_dir:
                 # buffering=1 gives line-buffered writes so each line hits the file immediately.
-                # Each run opens its own handle in append mode; O_APPEND makes concurrent
-                # writes from parallel runs of the same benchmark atomic at the OS level.
                 stdout_f = open(
-                    os.path.join(self._dump_dir, f"{entry.name}.stdout"),
-                    "a", encoding="utf-8", buffering=1,
+                    os.path.join(self._dump_dir, f"{entry.name}_{run_idx}.stdout"),
+                    "w", encoding="utf-8", buffering=1,
                 )
                 stderr_f = open(
-                    os.path.join(self._dump_dir, f"{entry.name}.stderr"),
-                    "a", encoding="utf-8", buffering=1,
+                    os.path.join(self._dump_dir, f"{entry.name}_{run_idx}.stderr"),
+                    "w", encoding="utf-8", buffering=1,
                 )
 
             try:
