@@ -59,18 +59,13 @@ class RunProcess:
                     try:
                         process = psutil.Process(proc.pid)
                         while proc.returncode is None:
-                            m = process.memory_full_info()
-
-                            if "uss" in m:
-                                # Use USS if available (Linux)
-                                self._max_memory_used = max(
-                                    self._max_memory_used, m.uss / 1024 / 1024
-                                )
-                            else:
-                                # Update max memory used
-                                self._max_memory_used = max(
-                                    self._max_memory_used, m.rss / 1024 / 1024
-                                )
+                            try:
+                                m = process.memory_full_info()
+                                mem_mb = m.uss / 1024 / 1024
+                            except (RuntimeError, psutil.AccessDenied):
+                                m = process.memory_info()
+                                mem_mb = m.rss / 1024 / 1024
+                            self._max_memory_used = max(self._max_memory_used, mem_mb)
 
                             if self._max_memory_used > max_memory:
                                 kill_all(process)
