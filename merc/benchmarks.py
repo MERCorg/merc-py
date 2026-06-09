@@ -25,6 +25,24 @@ class _Entry:
     memory_limit: float | None
 
 
+def _load_existing_names(output: str) -> set[str]:
+    names: set[str] = set()
+    if not os.path.exists(output):
+        return names
+    with open(output, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+                if "name" in record:
+                    names.add(record["name"])
+            except json.JSONDecodeError:
+                pass
+    return names
+
+
 class Benchmarks:
     """Collects benchmark configurations and runs them, writing results to NDJSON."""
 
@@ -86,24 +104,32 @@ class Benchmarks:
     def run(self, output: str = "results.ndjson") -> None:
         """Execute all registered benchmarks and write one NDJSON record per run.
 
+        If *output* already exists, benchmarks whose name appears in it are
+        skipped and new results are appended rather than overwriting the file.
+
         Raises ToolNotFoundError if a tool binary cannot be found.
         """
         if self._dump_dir:
             os.makedirs(self._dump_dir, exist_ok=True)
 
+        existing = _load_existing_names(output)
+        for name in existing:
+            self._logger.info("Skipping '%s' (already in %s)", name, output)
+
         if self._sequential:
-            self._run_sequential(output)
+            self._run_sequential(output, existing)
         else:
-            self._run_parallel(output)
+            self._run_parallel(output, existing)
 
         self._logger.info("Results written to %s", output)
 
-    def _run_sequential(self, output: str) -> None:
-        total = sum(e.runs for e in self._entries)
+    def _run_sequential(self, output: str, existing: set[str]) -> None:
+        entries = [e for e in self._entries if e.name not in existing]
+        total = sum(e.runs for e in entries)
         done = 0
 
-        with open(output, "w", encoding="utf-8") as out:
-            for entry in self._entries:
+        with open(output, "a", encoding="utf-8") as out:
+            for entry in entries:
                 for run_idx in range(entry.runs):
                     done += 1
                     result = self._run_one(entry)
@@ -112,8 +138,9 @@ class Benchmarks:
                     out.write(json.dumps(record) + "\n")
                     out.flush()
 
-    def _run_parallel(self, output: str) -> None:
-        total = sum(e.runs for e in self._entries)
+    def _run_parallel(self, output: str, existing: set[str]) -> None:
+        entries = [e for e in self._entries if e.name not in existing]
+        total = sum(e.runs for e in entries)
         done = [0]
         done_lock = threading.Lock()
         file_lock = threading.Lock()
@@ -155,12 +182,12 @@ class Benchmarks:
         # Submit largest-threads-first so high-slot tasks acquire the semaphore
         # before small tasks get executor OS threads, reducing fragmentation.
         work = sorted(
-            ((entry, run_idx) for entry in self._entries for run_idx in range(entry.runs)),
+            ((entry, run_idx) for entry in entries for run_idx in range(entry.runs)),
             key=lambda x: x[0].threads,
             reverse=True,
         )
 
-        with open(output, "w", encoding="utf-8") as out:
+        with open(output, "a", encoding="utf-8") as out:
             with ThreadPoolExecutor(max_workers=self._max_threads) as executor:
                 futures = [
                     executor.submit(_run_entry, entry, run_idx, out)
