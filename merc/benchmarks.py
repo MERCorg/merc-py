@@ -16,6 +16,7 @@ from .run_process import (
 @dataclass
 class _Entry:
     name: str
+    cache_key: str
     tool: str
     arguments: list[str]
     extra: dict
@@ -36,8 +37,9 @@ def _load_existing_counts(output: str) -> dict[str, int]:
                 continue
             try:
                 record = json.loads(line)
-                if "name" in record:
-                    counts[record["name"]] = counts.get(record["name"], 0) + 1
+                if "name" in record and "cache_key" in record:
+                    key = f"{record['name']}_{record['cache_key']}"
+                    counts[key] = counts.get(key, 0) + 1
             except json.JSONDecodeError:
                 pass
     return counts
@@ -64,6 +66,7 @@ class Benchmarks:
     def add(
         self,
         name: str,
+        cache_key: str,
         tool: str,
         arguments: list[str],
         extra: dict | None = None,
@@ -76,6 +79,7 @@ class Benchmarks:
 
         Args:
             name:         Human-readable label shown in progress output.
+            cache_key:    Key used (with name) to identify cached runs.
             tool:         Executable path passed to RunProcess.
             arguments:    CLI arguments for the tool.
             extra:        Additional fields merged into every result record.
@@ -91,6 +95,7 @@ class Benchmarks:
         self._entries.append(
             _Entry(
                 name=name,
+                cache_key=cache_key,
                 tool=tool,
                 arguments=arguments,
                 extra=extra or {},
@@ -129,7 +134,8 @@ class Benchmarks:
         """Return (work_list, total_runs) for entries that still need runs."""
         work: list[tuple[_Entry, int, int]] = []
         for e in self._entries:
-            already_done = existing.get(e.name, 0)
+            key = f"{e.name}_{e.cache_key}"
+            already_done = existing.get(key, 0)
             remaining = e.runs - already_done
             if remaining > 0:
                 work.append((e, already_done, remaining))
@@ -139,7 +145,7 @@ class Benchmarks:
     @staticmethod
     def _make_record(entry: _Entry, run_idx: int, result: dict) -> str:
         """Build an NDJSON line for one benchmark run."""
-        record = {"name": entry.name, "run": run_idx + 1, **entry.extra, **result}
+        record = {"name": entry.name, "cache_key": entry.cache_key, "run": run_idx + 1, **entry.extra, **result}
         return json.dumps(record) + "\n"
 
     def _run_sequential(self, output: str, existing: dict[str, int]) -> None:
@@ -215,26 +221,26 @@ class Benchmarks:
     def _log_result(self, result: dict, done: int, total: int, entry: _Entry, run_idx: int) -> None:
         if result["status"] == "ok":
             self._logger.info(
-                "[%d/%d] %s  run %d/%d  %.2fs  %.1fMB",
-                done, total, entry.name, run_idx + 1, entry.runs,
+                "[%d/%d] %s [%s]  run %d/%d  %.2fs  %.1fMB",
+                done, total, entry.name, entry.cache_key, run_idx + 1, entry.runs,
                 result["time_s"], result["memory_mb"],
             )
         elif result["status"] == "timeout":
             self._logger.warning(
-                "[%d/%d] %s  run %d/%d  timeout after %.2fs",
-                done, total, entry.name, run_idx + 1, entry.runs,
+                "[%d/%d] %s [%s]  run %d/%d  timeout after %.2fs",
+                done, total, entry.name, entry.cache_key, run_idx + 1, entry.runs,
                 result["time_s"],
             )
         elif result["status"] == "oom":
             self._logger.warning(
-                "[%d/%d] %s  run %d/%d  OOM at %.1fMB",
-                done, total, entry.name, run_idx + 1, entry.runs,
+                "[%d/%d] %s [%s]  run %d/%d  OOM at %.1fMB",
+                done, total, entry.name, entry.cache_key, run_idx + 1, entry.runs,
                 result["memory_mb"],
             )
         else:
             self._logger.error(
-                "[%d/%d] %s  run %d/%d  error: %s",
-                done, total, entry.name, run_idx + 1, entry.runs,
+                "[%d/%d] %s [%s]  run %d/%d  error: %s",
+                done, total, entry.name, entry.cache_key, run_idx + 1, entry.runs,
                 result.get("message"),
             )
 
@@ -251,11 +257,11 @@ class Benchmarks:
             if self._dump_dir:
                 # buffering=1 gives line-buffered writes so each line hits the file immediately.
                 stdout_f = open(
-                    os.path.join(self._dump_dir, f"{entry.name}_{run_idx}.stdout"),
+                    os.path.join(self._dump_dir, f"{entry.name}_{entry.cache_key}_{run_idx}.stdout"),
                     "w", encoding="utf-8", buffering=1,
                 )
                 stderr_f = open(
-                    os.path.join(self._dump_dir, f"{entry.name}_{run_idx}.stderr"),
+                    os.path.join(self._dump_dir, f"{entry.name}_{entry.cache_key}_{run_idx}.stderr"),
                     "w", encoding="utf-8", buffering=1,
                 )
 
