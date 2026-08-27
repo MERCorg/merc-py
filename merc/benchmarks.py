@@ -145,7 +145,7 @@ class Benchmarks:
     @staticmethod
     def _make_record(entry: _Entry, run_idx: int, result: dict) -> str:
         """Build an NDJSON line for one benchmark run."""
-        record = {"name": entry.name, "cache_key": entry.cache_key, "run": run_idx + 1, **entry.extra, **result}
+        record = {"name": entry.name, "cache_key": entry.cache_key, "run": run_idx + 1, "tool": entry.tool, "arguments": entry.arguments, **entry.extra, **result}
         return json.dumps(record) + "\n"
 
     def _run_sequential(self, output: str, existing: dict[str, int]) -> None:
