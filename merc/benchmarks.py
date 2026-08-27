@@ -253,17 +253,19 @@ class Benchmarks:
 
         stdout_f = None
         stderr_f = None
+        paths: dict = {}
         try:
             if self._dump_dir:
+                stdout_path = os.path.join(
+                    self._dump_dir, f"{entry.name}_{entry.cache_key}_{run_idx}.stdout"
+                )
+                stderr_path = os.path.join(
+                    self._dump_dir, f"{entry.name}_{entry.cache_key}_{run_idx}.stderr"
+                )
+                paths = {"stdout": stdout_path, "stderr": stderr_path}
                 # buffering=1 gives line-buffered writes so each line hits the file immediately.
-                stdout_f = open(
-                    os.path.join(self._dump_dir, f"{entry.name}_{entry.cache_key}_{run_idx}.stdout"),
-                    "w", encoding="utf-8", buffering=1,
-                )
-                stderr_f = open(
-                    os.path.join(self._dump_dir, f"{entry.name}_{entry.cache_key}_{run_idx}.stderr"),
-                    "w", encoding="utf-8", buffering=1,
-                )
+                stdout_f = open(stdout_path, "w", encoding="utf-8", buffering=1)
+                stderr_f = open(stderr_path, "w", encoding="utf-8", buffering=1)
 
             try:
                 proc = RunProcess(
@@ -273,15 +275,15 @@ class Benchmarks:
                     read_stderr=lambda line: stderr_f.write(line + "\n") if stderr_f else None,
                     **kwargs,
                 )
-                return {"status": "ok", "time_s": proc.user_time, "memory_mb": proc.max_memory}
+                return {"status": "ok", "time_s": proc.user_time, "memory_mb": proc.max_memory, **paths}
             except TimeExceededError as e:
-                return {"status": "timeout", "time_s": e.value}
+                return {"status": "timeout", "time_s": e.value, **paths}
             except MemoryExceededError as e:
-                return {"status": "oom", "memory_mb": e.value}
+                return {"status": "oom", "memory_mb": e.value, **paths}
             except ToolNotFoundError:
                 raise
             except Exception as e:  # pylint: disable=broad-except
-                return {"status": "error", "message": str(e)}
+                return {"status": "error", "message": str(e), **paths}
         finally:
             if stdout_f:
                 stdout_f.close()

@@ -31,3 +31,44 @@ the tests, use the following command:
 ```bash
 python -m unittest discover -s merc/tests
 ```
+
+
+### `merc-py/merc/create_table.py`
+
+Generates a LaTeX table from JSON or NDJSON benchmark output.
+
+- With one input file, it keeps the old summary behavior.
+- With multiple input files, it merges rows by benchmark name plus the selected merge keys.
+- Each input contributes a `Time (s)` and `Memory (MB)` column for side-by-side comparison.
+
+```bash
+python3 merc-py/merc/create_table.py results.ndjson
+
+python3 merc-py/merc/create_table.py results-a.ndjson results-b.ndjson \
+	--merge-key threads \
+	--merge-key caching \
+	--label baseline \
+	--label optimized \
+	-o comparison.tex
+```
+
+### `merc-py/merc/create_plot.py`
+
+The scatter-plot counterpart of `create_table.py`. Generates a dependency-free
+pgfplots/TikZ scatter plot from JSON or NDJSON benchmark output (compiles with a
+stock TeX distribution; no Python plotting libraries required).
+
+- Every input file becomes one series.
+- Each benchmark case contributes a single aggregated point (`Time (s)` on the
+  x-axis and `Memory (MB)` on the y-axis by default).
+- Use `--x-metric` / `--y-metric`, `--log-x` / `--log-y`, and `--fragment` to
+  customize the axes and output.
+
+```bash
+python3 merc-py/merc/create_plot.py results.ndjson --log-x --log-y
+
+python3 merc-py/merc/create_plot.py results-a.ndjson results-b.ndjson \
+	--label baseline \
+	--label optimized \
+	-o comparison_scatter.tex
+```
